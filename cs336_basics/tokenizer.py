@@ -94,35 +94,35 @@ class BPETokenizer:
         self.norm_pat = re.compile(PAT)
 
     def encode(self, text: str) -> list[int]:
+        # 注意：为了兼容原有接口，这里返回 list
+        # 但内部处理我们要尽量精简内存
+        return list(self._encode_generator(text))
+
+    def _encode_generator(self, text: str):
+        """核心编码逻辑：使用生成器减少内存占用"""
         if not text:
-            return []
-            
-        ids = []
-        
-        # 第一步：按特殊 Token 切分文本
+            return
+
+        # 1. 物理切分特殊 Token
         if self.split_pat:
-            # re.split 会保留被括号捕获的特殊字符
             parts = self.split_pat.split(text)
         else:
             parts = [text]
-            
+
         for part in parts:
-            if not part:
-                continue
-                
-            # 第二步：检查当前部分是否是特殊 Token
+            if not part: continue
             if part in self.special_tokens_list:
                 p_bytes = part.encode("utf-8")
                 if p_bytes in self.byte_to_id:
-                    ids.append(self.byte_to_id[p_bytes])
+                    yield self.byte_to_id[p_bytes]
                 continue
-            
-            # 第三步：普通文本部分，按照 PAT 进一步切分
-            for sub_text in self.norm_pat.findall(part):
-                # 将子段转为字节序列进行 BPE 合并
+
+            # 2. 关键优化：使用 finditer 替代 findall
+            # finditer 不会一次性生成列表，而是按需生成匹配对象
+            for match in self.norm_pat.finditer(part):
+                sub_text = match.group()
                 word = [bytes([b]) for b in sub_text.encode("utf-8")]
                 
-                # BPE 合并逻辑
                 for p0, p1 in self.merges:
                     new_word = []
                     i = 0
@@ -135,21 +135,19 @@ class BPETokenizer:
                             i += 1
                     word = new_word
                 
-                # 查表转为 ID
                 for token_bytes in word:
                     if token_bytes in self.byte_to_id:
-                        ids.append(self.byte_to_id[token_bytes])
-        return ids
+                        yield self.byte_to_id[token_bytes]
+
+    def encode_iterable(self, text_iterable):
+        """流式处理大文件"""
+        for text in text_iterable:
+            # 直接调用生成器版编码，每一行处理完立即释放内存
+            yield from self._encode_generator(text)
 
     def decode(self, ids: list[int]) -> str:
         tokens_bytes = [self.vocab[idx] for idx in ids]
         return b"".join(tokens_bytes).decode("utf-8", errors="replace")
-
-    def encode_iterable(self, text_iterable):
-        for text in text_iterable:
-            for idx in self.encode(text):
-                yield idx
-
     
 def get_tokenizer(vocab, merges, special_tokens=None):
     return BPETokenizer(vocab, merges, special_tokens)
