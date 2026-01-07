@@ -1,8 +1,8 @@
 import regex as re
 from collections import Counter
+import regex as re  # 建议使用 regex 库以支持 \p{L}
 
-# 严格按照作业要求的 PAT
-PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+PAT = r"""'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
 def train_bpe(input_path, vocab_size, special_tokens):
     # 1. 初始化 Vocab
@@ -73,3 +73,83 @@ def train_bpe(input_path, vocab_size, special_tokens):
         word_counts = new_word_counts
         
     return vocab, merges
+
+class BPETokenizer:
+    def __init__(self, vocab, merges, special_tokens=None):
+        self.vocab = vocab
+        self.merges = merges
+        self.special_tokens_list = special_tokens or []
+        self.byte_to_id = {v: k for k, v in vocab.items()}
+        
+        # 构造一个专门匹配特殊 Token 的正则，长者优先
+        if self.special_tokens_list:
+            sorted_specials = sorted(self.special_tokens_list, key=len, reverse=True)
+            special_re = "|".join(re.escape(st) for st in sorted_specials)
+            # 使用括号捕获，这样 re.split 会保留分隔符
+            self.split_pat = re.compile(f"({special_re})")
+        else:
+            self.split_pat = None
+            
+        # 预编译普通文本的 PAT
+        self.norm_pat = re.compile(PAT)
+
+    def encode(self, text: str) -> list[int]:
+        if not text:
+            return []
+            
+        ids = []
+        
+        # 第一步：按特殊 Token 切分文本
+        if self.split_pat:
+            # re.split 会保留被括号捕获的特殊字符
+            parts = self.split_pat.split(text)
+        else:
+            parts = [text]
+            
+        for part in parts:
+            if not part:
+                continue
+                
+            # 第二步：检查当前部分是否是特殊 Token
+            if part in self.special_tokens_list:
+                p_bytes = part.encode("utf-8")
+                if p_bytes in self.byte_to_id:
+                    ids.append(self.byte_to_id[p_bytes])
+                continue
+            
+            # 第三步：普通文本部分，按照 PAT 进一步切分
+            for sub_text in self.norm_pat.findall(part):
+                # 将子段转为字节序列进行 BPE 合并
+                word = [bytes([b]) for b in sub_text.encode("utf-8")]
+                
+                # BPE 合并逻辑
+                for p0, p1 in self.merges:
+                    new_word = []
+                    i = 0
+                    while i < len(word):
+                        if i < len(word) - 1 and word[i] == p0 and word[i+1] == p1:
+                            new_word.append(p0 + p1)
+                            i += 2
+                        else:
+                            new_word.append(word[i])
+                            i += 1
+                    word = new_word
+                
+                # 查表转为 ID
+                for token_bytes in word:
+                    if token_bytes in self.byte_to_id:
+                        ids.append(self.byte_to_id[token_bytes])
+        return ids
+
+    def decode(self, ids: list[int]) -> str:
+        tokens_bytes = [self.vocab[idx] for idx in ids]
+        return b"".join(tokens_bytes).decode("utf-8", errors="replace")
+
+    def encode_iterable(self, text_iterable):
+        for text in text_iterable:
+            for idx in self.encode(text):
+                yield idx
+
+    
+def get_tokenizer(vocab, merges, special_tokens=None):
+    return BPETokenizer(vocab, merges, special_tokens)
