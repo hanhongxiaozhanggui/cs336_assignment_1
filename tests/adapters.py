@@ -554,4 +554,5 @@ def get_tokenizer(
 def run_train_bpe(input_path, vocab_size, special_tokens, **kwargs):
     # 调用你刚才写的逻辑
     vocab, merges = train_bpe(input_path, vocab_size, special_tokens)
+
     return vocab, merges
