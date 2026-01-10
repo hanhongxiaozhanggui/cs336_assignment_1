@@ -1,0 +1,9 @@
+data_bin/
+data/
+*.bin
+*.pt
+__pycache__/
+.idea/
+.venv/
+uv.lock
+EOF
