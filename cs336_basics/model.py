@@ -112,17 +112,28 @@ class GPT(nn.Module):
         nn.init.normal_(self.wte, std=0.02)
         nn.init.normal_(self.wpe, std=0.02)
 
-    def forward(self, idx):
+    def forward(self, idx, targets=None):
         device = idx.device
         b, t = idx.size()
         pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0)
         
-        # 使用对应的属性名访问
+        # 1. 前向传播
         x = self.wte[idx] + self.wpe[pos]
         for block in self.h:
             x = block(x)
         x = self.ln_f(x)
         
-        # 权重共享输出层
-        logits = torch.matmul(x, self.wte.t())
-        return logits
+        # 2. 计算 Logits
+        logits = torch.matmul(x, self.wte.t()) # (B, T, vocab_size)
+
+        # 3. 如果传入了 targets，则计算 loss
+        loss = None
+        if targets is not None:
+            # 将 logits 展平为 (B*T, vocab_size)，targets 展平为 (B*T)
+            loss = torch.nn.functional.cross_entropy(
+                logits.view(-1, logits.size(-1)), 
+                targets.view(-1), 
+                ignore_index=-1
+            )
+
+        return logits, loss
