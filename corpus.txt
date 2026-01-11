@@ -1,0 +1,3 @@
+Hello world!
+This is a test corpus for BPE tokenizer.
+你可以在这里加入一些中文。
