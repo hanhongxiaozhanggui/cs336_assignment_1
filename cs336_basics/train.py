@@ -1,63 +1,96 @@
+import os
+import time
+import math
 import torch
 import numpy as np
-import os
-from cs336_basics.model import GPT, GPTConfig  # 假设你的模型定义在这里
-from cs336_basics.optimizer import AdamW      # 假设你的优化器定义在这里
+from cs336_basics.model import GPT, GPTConfig
 
-# --- 1. 配置超参数 ---
-device = "cuda" if torch.cuda.is_available() else "cpu"
-batch_size = 32      # 根据显存调整
-block_size = 256     # 上下文长度
-max_iters = 5000     # 迭代次数
-lr = 6e-4            # 学习率
-eval_interval = 500  # 每隔多少步验证一次
+# --- 1. 超参数配置 ---
+batch_size = 64
+block_size = 256
+max_iters = 10000  # 建议增加到 10000，4090 跑得很快
+learning_rate = 6e-4
+device = "cuda"
+dtype = 'bfloat16'
 
-# --- 2. 数据读取函数 ---
+# --- 2. 模型配置 ---
+config = GPTConfig(
+    vocab_size = 32769, # 必须是 32769 以匹配 EOT_ID 32768
+    block_size = block_size,
+    n_layer = 8,
+    n_head = 8,
+    n_embd = 512,
+)
+
+# --- 3. 数据加载优化 ---
+data_dir = "data_bin"
 def get_batch(split):
-    filename = f"data_bin/TinyStoriesV2-GPT4-{split}.bin"
-    # 使用 memmap 避免将整个 3.5G 文件载入内存
+    # 修改：匹配刚才 prepare_data.py 生成的文件名
+    s = "train" if split == "train" else "valid"
+    filename = os.path.join(data_dir, f"TinyStoriesV2-GPT4-{s}.bin")
+    
+    if not os.path.exists(filename):
+        raise FileNotFoundError(f"找不到数据文件: {filename}，请检查 data_bin 目录")
+        
     data = np.memmap(filename, dtype=np.uint16, mode='r')
     
-    # 随机选择起始索引
     ix = torch.randint(len(data) - block_size, (batch_size,))
+    
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
     
-    return x.to(device), y.to(device)
+    x, y = x.to(device), y.to(device)
+    return x, y
 
-# --- 3. 初始化模型和优化器 ---
-config = GPTConfig(vocab_size=32768, block_size=block_size)
+# --- 4. 初始化 ---
+print(f"🚀 正在 {device} 上启动 8 层 GPT 训练...")
 model = GPT(config).to(device)
 
-# 手动 CrossEntropy 实现 (作业要求)
-def get_loss(logits, targets):
-    # logits: (B, T, V), targets: (B, T)
-    return torch.nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+if hasattr(torch, 'compile'):
+    print("正在进行 torch.compile 静态编译 (这可能需要 1-2 分钟)...")
+    model = torch.compile(model)
 
-optimizer = AdamW(model.parameters(), lr=lr, weight_decay=0.1)
+optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-1)
 
-# --- 4. 主训练循环 ---
-print(f"正在 {device} 上启动训练...")
-for iter in range(max_iters):
-    # 获取数据
+def get_lr(it):
+    if it < 200: return learning_rate * it / 200 # 稍微延长预热
+    decay_ratio = (it - 200) / (max_iters - 200)
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return 1e-5 + coeff * (learning_rate - 1e-5)
+
+# --- 5. 训练循环 ---
+start_time = time.time()
+
+for it in range(max_iters):
+    lr = get_lr(it)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+
     xb, yb = get_batch('train')
-    
-    # 前向传播
-    logits = model(xb)
-    loss = get_loss(logits, yb)
-    
-    # 反向传播
-    optimizer.zero_grad()
-    loss.backward()
-    
-    # 梯度裁剪 (防止梯度爆炸)
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-    
-    optimizer.step()
-    
-    if iter % 100 == 0:
-        print(f"Step {iter}: Loss = {loss.item():.4f}")
 
-# 保存模型
-torch.save(model.state_dict(), "checkpoint.pt")
-print("训练完成，模型已保存。")
+    with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+        logits, loss = model(xb, yb)
+
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    optimizer.step()
+
+    if it % 100 == 0:
+        t1 = time.time()
+        # 增加一个简单的评估逻辑，看看验证集 Loss
+        model.eval()
+        with torch.no_grad():
+            xv, yv = get_batch('val')
+            with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+                _, v_loss = model(xv, yv)
+        model.train()
+        
+        print(f"Step {it:4d}: Train Loss = {loss.item():.4f} | Val Loss = {v_loss.item():.4f} | LR = {lr:.2e} | Time = {t1-start_time:.2f}s")
+        start_time = t1
+
+# --- 6. 优雅保存 ---
+# 移除 torch.compile 带来的前缀
+raw_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+torch.save(raw_model.state_dict(), "checkpoint_optimized.pt")
+print("\n✅ 训练完成！模型已清理前缀并保存。")
